@@ -23,9 +23,8 @@ N_TOTAL     = N_WARMUP + N_MEASURE
 
 MLPACKAGE   = Path(__file__).resolve().parents[3] / 'outputs' / \
               'StatefulMambaHybrid1D_seq224_c1000_alpha0.1.mlpackage'
-
-# CoreML state keys (coremltools renamed dots to underscores)
-STATE_KEYS = ['mamba_angle_state', 'mamba_k_state', 'mamba_v_state', 'mamba_ssm_state']
+WEIGHTS     = Path(__file__).resolve().parents[3] / 'outputs' / \
+              'StatefulMambaHybrid1D_seq224_c1000_alpha0.1.pt'
 
 TOL_ANE = {'max_abs': 3e-2, 'cosine_sim': 0.999}
 
@@ -33,13 +32,15 @@ TOL_ANE = {'max_abs': 3e-2, 'cosine_sim': 0.999}
 
 print(f"Loading .mlpackage from {MLPACKAGE}")
 assert MLPACKAGE.exists(), f"mlpackage not found: {MLPACKAGE}"
+assert WEIGHTS.exists(), f"weights not found: {WEIGHTS} — run export_for_parity.py first"
 
 mlmodel = ct.models.MLModel(str(MLPACKAGE),
                              compute_units=ct.ComputeUnit.CPU_AND_NE)
 print("CoreML model loaded (CPU_AND_NE)")
 
-torch.manual_seed(SEED)
-pt_model = StatefulMambaHybrid1D().float().eval()  # CPU on mac
+pt_model = StatefulMambaHybrid1D().float().eval()
+pt_model.load_state_dict(torch.load(WEIGHTS, map_location='cpu'))
+print(f"PyTorch weights loaded from {WEIGHTS.name}")
 
 # Reset pytorch state buffers
 for buf in ['angle_state', 'ssm_state', 'k_state', 'v_state']:
