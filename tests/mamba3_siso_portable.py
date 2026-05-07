@@ -80,9 +80,7 @@ def rope_pairwise(
     x_out = torch.stack([xo0, xo1], dim=-1).flatten(-2)
 
     if rotary_dim < x.shape[-1]:
-        # x_pass may be fp16 while x_out is fp32 (promoted by fp32 cos/sin).
-        # Cast x_pass to x_out's dtype so torch.cat doesn't raise.
-        x_out = torch.cat([x_out, x_pass.to(x_out.dtype)], dim=-1)
+        x_out = torch.cat([x_out, x_pass], dim=-1)
 
     return x_out
 
@@ -159,6 +157,10 @@ class Mamba3SISOPortable(nn.Module):
 
         self.in_proj  = nn.Linear(d_model, d_in_proj, bias=False, **factory_kwargs)
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False, **factory_kwargs)
+
+        # Conv1d for ANE dispatch: treats feature dim as spatial with 1 channel
+        self.in_conv  = nn.Conv1d(1, 1, kernel_size=3, padding=1, bias=False, **factory_kwargs)
+        self.out_conv = nn.Conv1d(1, 1, kernel_size=3, padding=1, bias=False, **factory_kwargs)
 
         # dt_bias [§2.1]
         self.dt_bias = nn.Parameter(torch.zeros(self.nheads, **factory_kwargs))
@@ -271,7 +273,8 @@ class Mamba3SISOPortable(nn.Module):
         B = u.shape[0]
 
         # ── Stage 1: in_proj + split  [§1] ──────────────────────────────────
-        zxBCdt = self.in_proj(u)
+        u_conv = self.in_conv(u.unsqueeze(1)).squeeze(1)   # (B, 1, d_model) → conv → (B, d_model)
+        zxBCdt = self.in_proj(u_conv)
         cap('in_proj_out', zxBCdt)
 
         z_raw, x_raw, B_raw, C_raw, dd_dt, dd_A, trap_raw, angles_raw = \
@@ -366,54 +369,45 @@ class Mamba3SISOPortable(nn.Module):
         cap('gamma', gamma)
 
         # ── Stage 6: SSM recurrence  [§4] ───────────────────────────────────
-        # Cast all SSM inputs to ssm_state.dtype (always fp32) to avoid mixed-dtype
-        # einsum errors and to match the original Triton kernel which accumulates in fp32.
-        # Using .to(ssm_state.dtype) rather than .float() so the cast is relative, not
-        # hardcoded to torch.float32.
-        sd = ssm_state.dtype                             # fp32 always (see allocate_states)
-        K      = K_rot.squeeze(1).to(sd)               # (B, nheads, d_state)
-        Q      = Q_rot.squeeze(1).to(sd)               # (B, nheads, d_state)
-        k_prev = k_state.squeeze(1).to(sd)             # (B, nheads, d_state)
-        x_s    = x.to(sd)                              # (B, nheads, headdim)
-        v_s    = v_state.to(sd)                        # (B, nheads, headdim)
+        K      = K_rot.squeeze(1)                                           # (B, nheads, d_state)
+        Q      = Q_rot.squeeze(1)                                           # (B, nheads, d_state)
+        k_prev = k_state.squeeze(1)                                         # (B, nheads, d_state)
 
-        # Outer products: V ⊗ K → (B, nheads, headdim, d_state)  [§4 Δh formula]
-        outer_curr = torch.einsum("bnh,bns->bnhs", x_s,  K)
-        outer_prev = torch.einsum("bnh,bns->bnhs", v_s,  k_prev)
+        # Outer products: V ⊗ K via matmul(V.unsqueeze(-1), K.unsqueeze(-2))
+        outer_curr = torch.matmul(x.unsqueeze(-1),       K.unsqueeze(-2))       # (B, n, h, s)
+        outer_prev = torch.matmul(v_state.unsqueeze(-1), k_prev.unsqueeze(-2))  # (B, n, h, s)
 
         # Δh = β·(V_{t-1}⊗K_{t-1}) + γ·(V_t⊗K_t)
-        g4 = gamma.to(sd)[:, :, None, None]
-        b4 = beta.to(sd)[ :, :, None, None]
+        g4 = gamma[:, :, None, None]
+        b4 = beta[:, :, None, None]
         delta_h = b4 * outer_prev + g4 * outer_curr
         cap('delta_h', delta_h)
         cap('ssm_state_before', ssm_state)
 
         # h = α·h_{t-1} + Δh
-        new_ssm_state = alpha.to(sd)[:, :, None, None] * ssm_state + delta_h
+        new_ssm_state = alpha[:, :, None, None] * ssm_state + delta_h
         cap('ssm_state_after', new_ssm_state)
 
-        # State updates — cast K back to the original k_state dtype, mirroring the Triton
-        # kernel which stores fp32 rotated K to the fp16 output tensor.
-        new_k_state = K_rot.to(k_state.dtype)   # (B, 1, nheads, d_state)
+        new_k_state = K_rot                      # (B, 1, nheads, d_state)
         new_v_state = x                          # (B, nheads, headdim)
 
         # ── Stage 7: output y  [§5] ─────────────────────────────────────────
-        # y = h·Q  — both in sd (fp32), result is fp32
-        y = torch.einsum("bnhs,bns->bnh", new_ssm_state, Q)   # (B, nheads, headdim)
+        # y = h·Q via matmul: (B, n, h, s) @ (B, n, s, 1) → (B, n, h, 1) → squeeze
+        y = torch.matmul(new_ssm_state, Q.unsqueeze(-1)).squeeze(-1)       # (B, nheads, headdim)
         cap('y_after_hQ', y)
 
         # y = y + D·V  (skip connection)
-        y = y + self.D.to(sd)[None, :, None] * x_s
+        y = y + self.D[None, :, None] * x
         cap('y_after_DV', y)
 
         # y = y ⊙ SiLU(z)  (gate)
-        y = y * F.silu(z.to(sd))
+        y = y * F.silu(z)
         cap('y_after_gate', y)
 
         # ── Stage 8: output projection  [§6] ────────────────────────────────
         y_flat = y.reshape(B, self.d_inner)
-        # Cast to weight dtype to handle fp32 y in fp16 model (from SSM fp32 promotion)
-        out = self.out_proj(y_flat.to(self.out_proj.weight.dtype))
+        y_conv = self.out_conv(y_flat.unsqueeze(1)).squeeze(1)
+        out = self.out_proj(y_conv)
         cap('out', out)
 
         return out, new_angle_state, new_ssm_state, new_k_state, new_v_state

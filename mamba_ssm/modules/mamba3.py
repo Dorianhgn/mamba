@@ -231,7 +231,7 @@ class Mamba3(nn.Module):
                 D=self.D,
                 Z=z if not self.is_outproj_norm else None,
                 chunk_size=self.chunk_size,
-                Input_States=None,
+                Input_States=(angle_dt_state, ssm_state, k_state.squeeze(1), v_state) if ssm_state is not None else None,
                 return_final_states=ssm_state is not None,
                 cu_seqlens=cu_seqlens,
             )

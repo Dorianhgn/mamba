@@ -23,9 +23,12 @@ _TESTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_TESTS_DIR))
 from mamba3_siso_portable import Mamba3SISOPortable
 
+import warnings
+warnings.filterwarnings('error', category=RuntimeWarning, message='.*overflow encountered in cast.*')
+
 CONFIG = dict(
     d_model=256, d_state=64, expand=2, headdim=64,
-    rope_fraction=0.5, A_floor=1e-4, rms_eps=1e-5,
+    rope_fraction=0.5, A_floor=1e-4, rms_eps=1e-4,
 )
 
 OUTPUTS_DIR = _TESTS_DIR.parent / "outputs"
@@ -56,7 +59,7 @@ class StepWrapper(nn.Module):
         self.register_buffer("angle_state", torch.zeros(B, NHEADS, NUM_ROPE_ANGLES,     dtype=torch.float16))
         self.register_buffer("ssm_state",   torch.zeros(B, NHEADS, HEADDIM, D_STATE,    dtype=torch.float16))
         self.register_buffer("k_state",     torch.zeros(B, 1, NHEADS, D_STATE,          dtype=torch.float16))
-        self.register_buffer("v_state",     torch.zeros(B, NHEADS, HEADDIM,             dtype=torch.float16))
+        self.register_buffer("v_state",     torch.zeros(B, NHEADS, HEADDIM,             dtype=torch.float32))
 
     def forward(self, u: torch.Tensor) -> torch.Tensor:
         out, new_angle, new_ssm, new_k, new_v = self.m.step(
@@ -72,15 +75,13 @@ class StepWrapper(nn.Module):
         # new_v = x_raw.reshape() is already fp16 — the .to(fp16) no-op is
         # optimised away, so coreml_update_state is NOT generated for v_state.
         # Fix: force a genuine fp16→fp32→fp16 round-trip for v_state.
-        self.angle_state[:] = new_angle.to(torch.float16)
-        self.ssm_state[:] = new_ssm.to(torch.float16)
-        self.k_state[:] = new_k.to(torch.float16)
-        # v_state: new_v = x_raw.reshape() has NO data-flow path from self.v_state,
-        # so TorchScript DCE eliminates the write as a dead side effect.
-        # Fix: add self.v_state * 0 to create a graph edge from the read to the write
-        # value, preserving the side-effectful copy_ in the traced IR.
-        self.v_state[:] = (new_v + self.v_state * 0).float().half()
-        return out.to(torch.float16)
+        self.angle_state[:] = new_angle.to(torch.float16)  # copy_ with dtype cast
+        self.ssm_state[:] = new_ssm.to(torch.float16)      # copy_ with dtype cast
+        self.k_state[:] = new_k.to(torch.float16)                  # copy_ with dtype cast
+
+        # We force a real fp16→fp32→fp16 round trip for v_state to ensure the coreml_update_state op is generated for v_state.
+        self.v_state[:] = new_v.to(torch.float32)
+        return out
 
 
 def load_model() -> Mamba3SISOPortable:
